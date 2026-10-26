@@ -5,6 +5,16 @@
    :width: 50%
    :target: https://kikuchipy.org
 
+**About this fork.** This is ``helpimlost97/kikuchipy-workbench``, a fork of Johan Westraadt's
+`jwestraadt/kikuchipy <https://github.com/jwestraadt/kikuchipy>`_, which adds EMSphInx-style spherical
+indexing with a CuPy GPU backend to kikuchipy. It exists to serve the
+`Kikuchi workbench <https://github.com/helpimlost97/kikuchi-workbench>`_, a PyQt5 GUI for GPU pattern
+processing and spherical indexing, whose ``requirements.txt`` installs this fork at a pinned commit.
+Branch ``develop`` is Johan's ``develop`` at ``4c7a0035`` plus the workbench's patches (fast lazy loading
+of large EDAX ``.up1``/``.up2`` files; release of CuPy's cuFFT plan caches after a GPU run so VRAM is
+freed). Branch ``develop-fused-wigner`` adds an experimental fused Wigner GPU kernel that is not
+benchmarked end to end; do not use it for production. Everything below is the upstream README.
+
 kikuchipy [ki-ko-chi-pai] is a library for processing, simulating, and indexing of
 electron backscatter diffraction (EBSD) patterns in Python.
 It is built on the tools for multi-dimensional data analysis provided by the HyperSpy
