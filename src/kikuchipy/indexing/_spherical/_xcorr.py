@@ -1210,13 +1210,399 @@ def _derivatives(
     mirror: bool,
     n_fold: int,
     der: bool,
+    rows: np.ndarray,
+    e_km: np.ndarray,
+    w_jkm: np.ndarray,
+    b_jkm: np.ndarray,
+) -> float:
+    """Return the cross-correlation at one rotation and, optionally,
+    write its gradient and Hessian, without materialising the Wigner
+    d table.
+
+    Same contract and **bitwise the same result** as
+    :func:`_derivatives_table`, the straight port, which rebuilds the
+    whole ``(bw, bw, bw, 2)`` Wigner d table (30 MB at ``bw`` 123)
+    on every evaluation and then reads it back.  Measured on an RKD
+    scan at ``bw`` 123 (2026-10-24, 479 x 479 px, laptop with 8
+    performance cores): one refinement costs 7.6 ms on one thread but
+    20 ms per thread when 8 dask workers refine at once, a 2.65 x
+    slowdown that the preprocessing stages do not show -- memory
+    traffic, not arithmetic.  Here the degree recurrence of every
+    order pair is run once and consumed immediately, so the working
+    set is three ``(bw, bw, 2)`` planes (726 KB at ``bw`` 123),
+    cache resident, and the kernel is compute bound.
+
+    How the fusion keeps the sum bitwise identical: the straight port
+    reads, for the pair ``(m, n)`` at degree ``j``, the table rows of
+    ``(m, n)``, ``(m + 1, n)`` and ``(m + 2, n)`` (the two beta
+    derivative recurrences), and accumulates in the order ``m``
+    ascending, ``n`` ascending, ``j`` ascending.  This kernel runs the
+    outer loop over ``mo = 0 .. bw + 1``: it first fills the plane
+    ``rows[mo % 3]`` with the rows of every pair ``(mo, n)`` by the
+    very recursion of
+    :func:`kikuchipy.indexing._spherical._wigner.
+    _wigner_d_table_pre_kernel` (same operations in the same order,
+    times the same ``sign`` / ``sign_n`` factor the table stores, so
+    the values are bitwise those of the table), and then accumulates
+    the pair ``(mo - 2, n)``, whose three rows are now the three
+    planes.  The accumulation order is therefore unchanged, and so
+    is every floating point operation of it.  The multiple-angle
+    recursions for ``exp(i m alpha)`` and ``exp(i n gamma)`` are
+    evaluated once into two arrays (the straight port recomputes the
+    gamma one per ``m``; the values are the same numbers).  The
+    recurrence of each ordered pair is computed once; the table
+    kernel computes each unordered pair once and stores both orders,
+    so this does about twice the recurrence arithmetic, which is a
+    small part of the evaluation.
+
+    Parameters
+    ----------
+    flm, gln, eu, jac, hes, bandwidth, mirror, n_fold, der
+        As :func:`_derivatives_table`.
+    rows
+        ``(3, bw, bw, 2)`` 64-bit float caller-owned scratch, any
+        content (``numpy.empty`` is fine: every slot read was written
+        in this call, the degree guards of the straight port see to
+        that).  Not to be shared between threads.
+    e_km, w_jkm, b_jkm
+        The beta independent factor triple of
+        :func:`kikuchipy.indexing._spherical._wigner.
+        wigner_d_table_factors`, read only and shareable.
+
+    Returns
+    -------
+    value
+        Cross-correlation at ``eu``, see :func:`_derivatives_table`.
+    """
+    # correlation, jacobian, hessian as 00, 11, 22, 01, 12, 20
+    wrk = np.zeros(10)
+
+    beta = _euler._wrap_beta(eu[1])
+    sin_a = math.sin(eu[0])
+    cos_a = math.cos(eu[0])
+    sin_g = math.sin(eu[2])
+    cos_g = math.cos(eu[2])
+    t = np.cos(beta)
+    negative_beta = math.copysign(1.0, beta) < 0.0
+    csc = (1.0 / np.sqrt(1.0 - t * t)) * (-1.0 if negative_beta else 1.0)
+    d_j = 2 if mirror else 1
+
+    # ---- the beta dependent constants of _wigner_d_table_pre_kernel ----
+    is_type_0 = not (math.copysign(1.0, t) < 0.0)
+    tc = 1.0 - t
+    tc_n = 1.0 + t
+    c2 = math.sqrt(tc_n / 2)
+    s2 = math.sqrt(tc / 2)
+    t0 = tc if is_type_0 else t
+    t_n = -t if is_type_0 else tc_n
+    pc2 = np.empty(bandwidth * 2)
+    ps2 = np.empty(bandwidth * 2)
+    for i in range(bandwidth * 2):
+        pc2[i] = c2 ** float(i)
+        ps2[i] = s2 ** float(i)
+
+    # ---- exp(i m alpha) and exp(i n gamma) for every order, the ----
+    # ---- multiple-angle recursions of the straight port, verbatim ----
+    ea_r = np.empty(bandwidth)
+    ea_i = np.empty(bandwidth)
+    ua0 = 0.0
+    ua1 = sin_a * 2.0
+    ua2 = 1.0
+    ta0 = 0.0
+    ta1 = cos_a
+    ta2 = 1.0
+    for m in range(bandwidth):
+        if m < 2:
+            ua0 = 0.0 if m == 0 else sin_a
+            ta0 = 1.0 if m == 0 else cos_a
+        else:
+            ua0 = sin_a * ua1 * 2.0 - ua2
+            ta0 = cos_a * ta1 * 2.0 - ta2
+            if m % 2 == 0:
+                sm = ua1 * cos_a * (1.0 if ((m // 2) - 1) % 2 == 0 else -1.0)
+            else:
+                sm = (ua0 - sin_a * ua1) * (1.0 if ((m - 1) // 2) % 2 == 0 else -1.0)
+            cm = ta0
+            ua2 = ua1
+            ua1 = ua0
+            ta2 = ta1
+            ta1 = ta0
+            ua0 = sm
+            ta0 = cm
+        ea_r[m] = ta0
+        ea_i[m] = ua0
+    eg_r = np.empty(bandwidth)
+    eg_i = np.empty(bandwidth)
+    ug0 = 0.0
+    ug1 = sin_g * 2.0
+    ug2 = 1.0
+    tg0 = 0.0
+    tg1 = cos_g
+    tg2 = 1.0
+    for n in range(bandwidth):
+        if n < 2:
+            ug0 = 0.0 if n == 0 else sin_g
+            tg0 = 1.0 if n == 0 else cos_g
+        else:
+            ug0 = sin_g * ug1 * 2.0 - ug2
+            tg0 = cos_g * tg1 * 2.0 - tg2
+            if n % 2 == 0:
+                sn = ug1 * cos_g * (1.0 if ((n // 2) - 1) % 2 == 0 else -1.0)
+            else:
+                sn = (ug0 - sin_g * ug1) * (1.0 if ((n - 1) // 2) % 2 == 0 else -1.0)
+            cn = tg0
+            ug2 = ug1
+            ug1 = ug0
+            tg2 = tg1
+            tg1 = tg0
+            ug0 = sn
+            tg0 = cn
+        eg_r[n] = tg0
+        eg_i[n] = ug0
+
+    for mo in range(bandwidth + 2):
+        # ---- fill plane mo % 3 with the rows d^j_{mo, n}(beta), all n ----
+        # Only planes the accumulation reads: the plane of an order
+        # ``m % n_fold == 0``, and with derivatives those of ``m + 1``
+        # and ``m + 2``.  The table kernel builds every order; for the
+        # 4-fold nickel master this skips a quarter of the recurrences
+        # with derivatives and three quarters without (the denominator
+        # evaluations).  A skipped plane is never read, see the guards
+        # of the accumulation below.
+        needed = mo % n_fold == 0
+        if der and not needed:
+            needed = (mo >= 1 and (mo - 1) % n_fold == 0) or (mo >= 2 and (mo - 2) % n_fold == 0)
+        if mo < bandwidth and needed:
+            plane = rows[mo % 3]
+            for n in range(bandwidth):
+                # the table stores the pair (k >= mm) at [k, mm] times
+                # ``sign`` and at [mm, k] times ``sign_n``; our row is
+                # the [mo, n] slot
+                if mo >= n:
+                    k = mo
+                    mm = n
+                    swapped = False
+                else:
+                    k = n
+                    mm = mo
+                    swapped = True
+                sign = 1.0
+                sign_n = 1.0 if (k - mm) % 2 == 0 else -1.0
+                if negative_beta:
+                    sign, sign_n = sign_n, sign
+                f = sign_n if swapped else sign
+                row = plane[n]
+
+                cn = pc2[k + mm]
+                sn = ps2[k - mm]
+                cn_n = ps2[k + mm]
+                sn_n = pc2[k - mm]
+                # first term of the three term recursion, equation 18
+                ekm = e_km[k, mm]
+                d_kkm = cn * sn * ekm
+                d_kkm_n = cn_n * sn_n * ekm
+                row[k, 0] = d_kkm * f
+                row[k, 1] = d_kkm_n * f
+                if k + 1 < bandwidth:
+                    # second term of the recursion, equation 19
+                    if is_type_0:
+                        a_km = _wigner._a_km_0(k, mm, t0)
+                        a_km_n = _wigner._a_km_2(k, mm, t_n)
+                    else:
+                        a_km = _wigner._a_km_2(k, mm, t0)
+                        a_km_n = _wigner._a_km_0(k, mm, t_n)
+                    d_k1km = d_kkm * a_km
+                    d_k1km_n = d_kkm_n * a_km_n
+                    row[k + 1, 0] = d_k1km * f
+                    row[k + 1, 1] = d_k1km_n * f
+                    if k + 2 < bandwidth:
+                        # recursively compute by degree, equation 10
+                        d_i2km = d_kkm
+                        d_i1km = d_k1km
+                        d_i2km_n = d_kkm_n
+                        d_i1km_n = d_k1km_n
+                        for i in range(k + 2, bandwidth):
+                            w = w_jkm[k, mm, i]
+                            b_ikm = b_jkm[k, mm, i]
+                            if is_type_0:
+                                a_jkm = _wigner._a_jkm_0_pre(w, i, k, mm, t0)
+                                a_jkm_n = _wigner._a_jkm_2_pre(w, i, k, mm, t_n)
+                            else:
+                                a_jkm = _wigner._a_jkm_2_pre(w, i, k, mm, t0)
+                                a_jkm_n = _wigner._a_jkm_0_pre(w, i, k, mm, t_n)
+                            d_ikm = a_jkm * d_i1km - b_ikm * d_i2km
+                            d_i2km = d_i1km
+                            d_i1km = d_ikm
+                            d_ikm_n = a_jkm_n * d_i1km_n - b_ikm * d_i2km_n
+                            d_i2km_n = d_i1km_n
+                            d_i1km_n = d_ikm_n
+                            row[i, 0] = d_i1km * f
+                            row[i, 1] = d_i1km_n * f
+
+        # ---- accumulate the pair (m, n) for m = mo - 2, all n: its ----
+        # ---- rows and those of (m + 1, n), (m + 2, n) are the planes ----
+        m = mo - 2
+        if m < 0:
+            continue
+        # the systematic zeros of the rotational symmetry (lines 951-952)
+        if m % n_fold != 0:
+            continue
+        exp_alpha_r = ea_r[m]
+        exp_alpha_i = ea_i[m]
+        p0 = rows[m % 3]
+        p1 = rows[(m + 1) % 3]
+        p2 = rows[(m + 2) % 3]
+        for n in range(bandwidth):
+            tg0 = eg_r[n]
+            ug0 = eg_i[n]
+
+            # detail::conjMult(expAlpha, expGamma, agP, agN) with the
+            # two sign prefactors of lines 996-1000
+            rr = exp_alpha_r * tg0
+            ii = exp_alpha_i * ug0
+            ri = exp_alpha_r * ug0
+            ir = exp_alpha_i * tg0
+            sign = 1.0 if (n + m) % 2 == 0 else -1.0
+            sign_n = 1.0 if n % 2 == 0 else -1.0
+            ag_p = complex(rr - ii, ir + ri) * sign
+            ag_n = complex(rr + ii, ir - ri) * (sign * sign_n)
+
+            # the first non-zero degree (lines 1003-1004)
+            start = m if m > n else n
+            if mirror and (start + m) % 2 != 0:
+                start += 1
+
+            # the quadrant weights, as in the straight port
+            wc = 1.0 + (1.0 if (m > 0 and n > 0) else 0.0)
+            wp = (1.0 if n > 0 else 0.0) + (1.0 if m > 0 else 0.0)
+
+            if der:
+                # prefactors of the beta derivatives (lines 1009-1020)
+                mm = m * m
+                mn = m * n
+                nn = n * n
+                coef2_0a = t * t * mm + (nn - m)
+                coef2_0b = t * n * (1 - 2 * m)
+                coef2_1a = t * (1 + 2 * m)
+                coef1_0pp = (t * m - n) * csc
+                coef1_0pn = (t * m + n) * csc
+                coef2_0pp = (coef2_0a + coef2_0b) * csc * csc
+                coef2_0pn = (coef2_0a - coef2_0b) * csc * csc
+                coef2_1pp = (coef2_1a - 2 * n) * csc
+                coef2_1pn = (coef2_1a + 2 * n) * csc
+
+                for j in range(start, bandwidth, d_j):
+                    d0p = p0[n, j, 0]
+                    d0n = p0[n, j, 1]
+                    d0p_1 = 0.0 if m >= j else p1[n, j, 0]
+                    d0n_1 = 0.0 if m >= j else p1[n, j, 1]
+                    d0p_2 = 0.0 if m + 1 >= j else p2[n, j, 0]
+                    d0n_2 = 0.0 if m + 1 >= j else p2[n, j, 1]
+
+                    # first and second beta derivatives of
+                    # d^j_{m,+/-n} (lines 1035-1041)
+                    jm = j - m
+                    rjm = math.sqrt(float(jm * (j + m + 1)))
+                    if jm == 0:
+                        coef2_2 = 0.0
+                    else:
+                        coef2_2 = math.sqrt(float((jm - 1) * (j + m + 2))) * rjm
+                    d1p = d0p * coef1_0pp - d0p_1 * rjm
+                    d1n = d0n * coef1_0pn + d0n_1 * rjm
+                    d2p = d0p * coef2_0pp - d0p_1 * rjm * coef2_1pp + d0p_2 * coef2_2
+                    d2n = d0n * coef2_0pn + d0n_1 * rjm * coef2_1pn + d0n_2 * coef2_2
+
+                    # detail::conjMult(flm[m, j], gln[n, j], vp, vc)
+                    # with the (j + m) parity negation of line 1046
+                    f = flm[m, j]
+                    g = gln[n, j]
+                    frr = f.real * g.real
+                    fii = f.imag * g.imag
+                    fri = f.real * g.imag
+                    fir = f.imag * g.real
+                    vp = complex(frr - fii, fir + fri)
+                    vc = complex(frr + fii, fir - fri)
+                    if (j + m) % 2 != 0:
+                        vp = -vp
+
+                    vc_pp = vc * ag_p
+                    vc_pp0 = vc_pp * d0p
+                    vc_pp1 = vc_pp * d1p
+                    vp_pn = vp * ag_n
+                    vp_pn0 = vp_pn * d0n
+                    vp_pn1 = vp_pn * d1n
+
+                    # the ten components of lines 1057-1070
+                    wrk[0] += vc_pp0.real * wc + vp_pn0.real * wp
+                    wrk[1] += vc_pp0.imag * -m * wc + vp_pn0.imag * -m * wp
+                    wrk[2] += vc_pp1.real * wc + vp_pn1.real * wp
+                    wrk[3] += vc_pp0.imag * -n * wc + vp_pn0.imag * n * wp
+                    wrk[4] += vc_pp0.real * -mm * wc + vp_pn0.real * -mm * wp
+                    wrk[5] += vc_pp.real * d2p * wc + vp_pn.real * d2n * wp
+                    wrk[6] += vc_pp0.real * -nn * wc + vp_pn0.real * -nn * wp
+                    wrk[7] += vc_pp1.imag * -m * wc + vp_pn1.imag * -m * wp
+                    wrk[8] += vc_pp1.imag * -n * wc + vp_pn1.imag * n * wp
+                    wrk[9] += vc_pp0.real * -mn * wc + vp_pn0.real * mn * wp
+            else:
+                # the value-only branch of lines 1080-1105
+                for j in range(start, bandwidth, d_j):
+                    d0p = p0[n, j, 0]
+                    d0n = p0[n, j, 1]
+                    f = flm[m, j]
+                    g = gln[n, j]
+                    frr = f.real * g.real
+                    fii = f.imag * g.imag
+                    fri = f.real * g.imag
+                    fir = f.imag * g.real
+                    vp_r = frr - fii
+                    vp_i = fir + fri
+                    vc_r = frr + fii
+                    vc_i = fir - fri
+                    if (j + m) % 2 != 0:
+                        vp_r = -vp_r
+                        vp_i = -vp_i
+                    vc_pp0 = vc_r * ag_p.real - vc_i * ag_p.imag
+                    vp_pn0 = vp_r * ag_n.real - vp_i * ag_n.imag
+                    wrk[0] += vc_pp0 * d0p * wc + vp_pn0 * d0n * wp
+
+    # the symmetrised copy-out of lines 1110-1117
+    if der:
+        jac[0] = wrk[1]
+        jac[1] = wrk[2]
+        jac[2] = wrk[3]
+        hes[0, 0] = wrk[4]
+        hes[0, 1] = wrk[7]
+        hes[0, 2] = wrk[9]
+        hes[1, 1] = wrk[5]
+        hes[1, 2] = wrk[8]
+        hes[2, 2] = wrk[6]
+        hes[1, 0] = hes[0, 1]
+        hes[2, 0] = hes[0, 2]
+        hes[2, 1] = hes[1, 2]
+    return wrk[0]
+
+
+@njit(cache=True, nogil=True, error_model="numpy")
+def _derivatives_table(
+    flm: np.ndarray,
+    gln: np.ndarray,
+    eu: np.ndarray,
+    jac: np.ndarray,
+    hes: np.ndarray,
+    bandwidth: int,
+    mirror: bool,
+    n_fold: int,
+    der: bool,
     d_beta: np.ndarray,
     e_km: np.ndarray,
     w_jkm: np.ndarray,
     b_jkm: np.ndarray,
 ) -> float:
     """Return the cross-correlation at one rotation and, optionally,
-    write its gradient and Hessian.
+    write its gradient and Hessian: the straight port, which rebuilds
+    the whole Wigner d table per call.  Kept as the oracle for
+    :func:`_derivatives`, which is bitwise equal to it; the refinement
+    no longer calls this one.
 
     Parameters
     ----------
@@ -2760,15 +3146,12 @@ class SphericalCrossCorrelator:
             self.wigner_d_factors = _wigner.wigner_d_table_factors(bandwidth)
         e_km, w_jkm, b_jkm = self.wigner_d_factors
         if self._d_beta is None:
-            self._d_beta = _wigner.wigner_d_table_pre(
-                bandwidth,
-                1.0,
-                False,
-                e_km,
-                w_jkm,
-                b_jkm,
-                out=np.full((bandwidth, bandwidth, bandwidth, 2), np.nan),
-            )
+            # The fused :func:`_derivatives` never materialises the
+            # ``(bw, bw, bw, 2)`` table (16 bw^3 bytes, 30 MB at bw
+            # 123, rebuilt per evaluation); it rolls three
+            # ``(bw, bw, 2)`` planes of Wigner d rows instead, 48 bw^2
+            # bytes, and writes every slot it reads, so no NaN fill
+            self._d_beta = np.empty((3, bandwidth, bandwidth, 2))
             self._jac = np.zeros(3)
             self._hes = np.zeros((3, 3))
             self._step = np.zeros(3)

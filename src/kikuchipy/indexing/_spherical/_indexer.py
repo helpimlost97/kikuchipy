@@ -1885,7 +1885,10 @@ class SphericalIndexer:
         n_bytes = n_correlators * side * side * self._half_side_length * 24
         n_bytes += side**3 * 8
         if refine:
-            n_bytes += n_correlators * 16 * self.bandwidth**3
+            # Three rolling (bw, bw, 2) planes per correlator clone since
+            # the fused ``_derivatives`` (develop-fused-wigner): it was
+            # the whole (bw, bw, bw, 2) Wigner d table, 16 bw^3 bytes
+            n_bytes += n_correlators * 48 * self.bandwidth**2
         return n_bytes
 
     @property
