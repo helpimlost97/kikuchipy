@@ -947,6 +947,8 @@ def _index_chunk_gpu(
         xp = session.xp
         padded, slots = _gpu._pad_batch(np, gln_stack, session.batch_size, keep)
         with session.lock:
+            # so that close() can clear this thread's cuFFT plans
+            session.register_plan_cache()
             gln_batch = xp.asarray(padded)
             # The pattern-side factors carry no phase term, so one
             # build serves every phase of the batch

@@ -1331,6 +1331,8 @@ def numpy_gpu_session(indexer, batch_size):
     session.xp = np
     session.fft = np.fft
     session.lock = threading.Lock()
+    # numpy has no plan cache to register
+    session.register_plan_cache = lambda: None
     session.batch_size = int(batch_size)
     session.table = table64.astype(np.float32)
     session.a_tables = tuple(

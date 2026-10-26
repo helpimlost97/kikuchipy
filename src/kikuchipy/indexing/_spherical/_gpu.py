@@ -1138,6 +1138,9 @@ class _GpuSession:
         self.xp = cupy
         self.fft = cupy.fft
         self.lock = _DEVICE_LOCK
+        # the cuFFT plan cache of every thread which transformed for
+        # this session, by thread identifier; cleared in close()
+        self._plan_caches: dict[int, Any] = {}
         self.batch_size = int(batch_size)
         self.bandwidth = int(indexer.bandwidth)
         slp = int(indexer.side_length)
@@ -1181,9 +1184,26 @@ class _GpuSession:
         # the batch spectrum buffer, zeroed at build (D2 freshness)
         self.fxc = cupy.zeros((self.batch_size, slp, slp, bwp), dtype=np.complex64)
 
+    def register_plan_cache(self) -> None:
+        """Remember the cuFFT plan cache of the calling thread, so
+        that :meth:`close` can clear it.
+
+        CuPy caches cuFFT plans per thread and per device, and a
+        cached plan keeps its work area on the device.  The
+        transforms run in dask worker threads which outlive the
+        session, so without this the work areas of every worker stay
+        allocated after the run, where freeing the memory pool cannot
+        reach them, and the next call measures almost no free VRAM.
+        Call inside the device section, i.e. with :attr:`lock` held.
+        """
+        thread_id = threading.get_ident()
+        if thread_id not in self._plan_caches:
+            self._plan_caches[thread_id] = self.xp.fft.config.get_plan_cache()
+
     def close(self) -> None:
-        """Dispose every device allocation of this session and free
-        the memory pool.  Idempotent: a second call is a no-op."""
+        """Dispose every device allocation of this session, clear the
+        cuFFT plan caches of the threads which used it and free the
+        memory pool.  Idempotent: a second call is a no-op."""
         cupy = getattr(self, "xp", None)
         self.a_tables = ()
         self.r_dens = ()
@@ -1191,6 +1211,11 @@ class _GpuSession:
         self.fxc = None
         self.xp = None
         self.fft = None
+        plan_caches = getattr(self, "_plan_caches", {})
+        for cache in plan_caches.values():
+            # drops the plans and with them their device work areas
+            cache.clear()
+        plan_caches.clear()
         if cupy is not None:
             cupy.get_default_memory_pool().free_all_blocks()
             cupy.get_default_pinned_memory_pool().free_all_blocks()
