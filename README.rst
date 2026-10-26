@@ -5,7 +5,7 @@
    :width: 50%
    :target: https://kikuchipy.org
 
-**About this fork.** This is ``helpimlost97/kikuchipy-workbench``, a fork of Johan Westraadt's
+**About this fork.** This is ``helpimlost97/kikuchipy``, a fork of Johan Westraadt's
 `jwestraadt/kikuchipy <https://github.com/jwestraadt/kikuchipy>`_, which adds EMSphInx-style spherical
 indexing with a CuPy GPU backend to kikuchipy. It exists to serve the
 `Kikuchi workbench <https://github.com/helpimlost97/kikuchi-workbench>`_, a PyQt5 GUI for GPU pattern
